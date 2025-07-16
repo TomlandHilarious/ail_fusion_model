@@ -311,60 +311,98 @@ class MultiModalDataset(Dataset):
         self.aligned_eeg, self.aligned_face = self.align_time()
         print("Data alignment complete!")
         
+        # Preprocess all data during initialization for efficient access
+        print("Preprocessing data for efficient access (this may take some time)...")
+        self._preprocess_all_data()
+        
     def __len__(self):
         # Now we only use the EEG indexer since we're matching face data dynamically
         return len(self.eeg_indexer)
 
-    def __getitem__(self, idx):
-        # Get the EEG data row from the indexer
-        eeg_row = self.eeg_indexer.rows[idx]
-        filepath, sub_id, eeg_stim, abs_start, abs_end = eeg_row
+
+    
+    def _preprocess_all_data(self):
+        """Preprocess all data at initialization for efficient access"""
+        # Dictionary to store all loaded CSV files
+        csv_cache = {}
+        # Dictionary to store all preprocessed samples
+        self.samples = []
         
-        # Look up the matching face data using our pre-aligned structures
-        try:
+        # Create an index mapping to locate samples efficiently
+        self.index_map = {}
+        total_samples = len(self.eeg_indexer.rows)
+        
+        print(f"Preprocessing {total_samples} samples...")
+        for i, eeg_row in enumerate(self.eeg_indexer.rows):
+            if i % 1000 == 0:
+                print(f"Processed {i}/{total_samples} samples ({i/total_samples*100:.1f}%)")
+                
+            filepath, sub_id, eeg_stim, abs_start, abs_end = eeg_row
+            
             # Check if we have face data for this subject and QP
-            if (sub_id in self.aligned_face and 
-                eeg_stim in self.aligned_face[sub_id]):
-                # Get the first face row for this subject and QP (already sorted by start time)
+            have_matching_face = False
+            if (sub_id in self.aligned_face and eeg_stim in self.aligned_face[sub_id]):
                 face_row = self.aligned_face[sub_id][eeg_stim][0]
                 face_filepath, _, _, face_abs_start, face_abs_end = face_row
                 have_matching_face = True
-            else:
-                print(f"Warning: No matching face data for subject {sub_id}, QP {eeg_stim}")
-                have_matching_face = False
-        except Exception as e:
-            print(f"Error finding matching face data: {str(e)}")
-            have_matching_face = False
-            
-        # Load and extract EEG features
-        eeg_df = pd.read_csv(filepath)
-        eeg_data_slice = eeg_df.iloc[abs_start:abs_end+1]
-        eeg_features = self.eeg_decoder(eeg_data_slice, win_len=self.eeg_win_size_sec, stride=self.eeg_win_step_sec)
-        
-        # Load and extract face features if available
-        if have_matching_face:
+                
+            # Process EEG data
             try:
-                face_df = pd.read_csv(face_filepath)
-                face_data_slice = face_df.iloc[face_abs_start:face_abs_end+1]
-                face_features = self.face_decoder(face_data_slice, win_len=self.face_win_size_sec, stride=self.face_win_step_sec)
+                # Load CSV if not already in cache
+                if filepath not in csv_cache:
+                    csv_cache[filepath] = pd.read_csv(filepath, engine='python')
+                    
+                eeg_df = csv_cache[filepath]
+                eeg_data_slice = eeg_df.iloc[abs_start:abs_end+1]
+                eeg_features = self.eeg_decoder(eeg_data_slice, win_len=self.eeg_win_size_sec, stride=self.eeg_win_step_sec)
+                
+                # Process face data if available
+                face_features = None
+                if have_matching_face:
+                    try:
+                        if face_filepath not in csv_cache:
+                            csv_cache[face_filepath] = pd.read_csv(face_filepath, engine='python')
+                            
+                        face_df = csv_cache[face_filepath]
+                        face_data_slice = face_df.iloc[face_abs_start:face_abs_end+1]
+                        face_features = self.face_decoder(face_data_slice, win_len=self.face_win_size_sec, stride=self.face_win_step_sec)
+                    except Exception:
+                        face_features = torch.zeros(1, len(self.face_cols), int(self.face_win_size_samples))
+                else:
+                    face_features = torch.zeros(1, len(self.face_cols), int(self.face_win_size_samples))
+                
+                # Get label
+                label = self.label_map.get((sub_id, eeg_stim), 0)
+                
+                # Store sample
+                sample = {
+                    'sub': sub_id,
+                    'question_period': eeg_stim,
+                    'eeg': eeg_features,
+                    'face': face_features,
+                    'label': torch.tensor(label, dtype=torch.long)
+                }
+                
+                self.samples.append(sample)
+                
             except Exception as e:
-                print(f"Error extracting face features: {str(e)}")
-                face_features = torch.zeros(1, len(self.face_cols), int(self.face_win_size_samples))
-        else:
-            # Default to zeros if no matching face data
-            face_features = torch.zeros(1, len(self.face_cols), int(self.face_win_size_samples))
+                print(f"Error preprocessing sample {i} (subject {sub_id}, QP {eeg_stim}): {e}")
+                # Create dummy sample for this index to maintain indexing consistency
+                self.samples.append({
+                    'sub': sub_id,
+                    'question_period': eeg_stim,
+                    'eeg': torch.zeros(1, len(self.eeg_cols), self.eeg_win_size_samples),
+                    'face': torch.zeros(1, len(self.face_cols), int(self.face_win_size_samples)),
+                    'label': torch.tensor(0, dtype=torch.long)
+                })
         
-        # Get the label for this sample
-        label = self.label_map.get((sub_id, eeg_stim), 0)
+        print(f"Preprocessing complete. Cached {len(self.samples)} samples.")
+        # Clear the CSV cache to free memory
+        del csv_cache
         
-        # return all features with the correct label
-        return {
-            'sub': sub_id,
-            'question_period': eeg_stim,
-            'eeg': eeg_features,
-            'face': face_features,
-            'label': torch.tensor(label, dtype=torch.long)  # Convert label to tensor
-        }
+    def __getitem__(self, idx):
+        """Simply return the preprocessed sample"""
+        return self.samples[idx]
 
     def align_time(self):
         # Get data and initialize result dictionaries
