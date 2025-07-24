@@ -4,6 +4,8 @@ import pandas as pd
 import numpy as np
 import re
 import os
+import json
+import hashlib
 from torch.utils.data import Dataset
 from typing import List, Literal
 from brainflow.data_filter import DataFilter, WindowOperations
@@ -207,8 +209,10 @@ class MultiModalDataset(Dataset):
         'AU20', 'AU23', 'AU25', 'AU26', 'AU45', 'Pupil'],
         eeg_mode:str='raw', face_mode:str='raw',
         eeg_fs:int=256, face_fs:int=30,
-        eeg_eps:float=1e-10, face_eps:float=1e-10):
-        # store metadata information
+        eeg_eps:float=1e-10, face_eps:float=1e-10,
+        use_cache:bool=True, cache_dir:str=None,
+        excluded_subjects: List[str]=None):
+        # store metadata information    
         self.eeg_folder = eeg_folder
         self.face_folder = face_folder 
         self.eeg_cols = eeg_cols
@@ -217,6 +221,9 @@ class MultiModalDataset(Dataset):
         self.face_mode = face_mode
         self.eeg_fs = eeg_fs
         self.face_fs = face_fs
+        
+        # Convert excluded_subjects to a set of strings for faster lookups
+        self.excluded_subjects = set(str(s) for s in excluded_subjects) if excluded_subjects else set()
         
         # Convert window size in seconds to samples
         self.eeg_win_size_sec = eeg_win_size
@@ -228,6 +235,90 @@ class MultiModalDataset(Dataset):
         self.face_win_step_sec = face_win_step
         self.face_win_size_samples = int(face_win_size * face_fs)
         self.face_win_step_samples = int(face_win_step * face_fs)
+
+        # Store all necessary instance variables
+        self.label_col = f"{attend_type}_attend"
+        self.label_map = {}
+        self.labels_df = pd.read_csv(label_file)
+        
+        # Check if the label column exists
+        if self.label_col not in self.labels_df.columns:
+            print(f"Warning: '{self.label_col}' not found in label file. Available columns: {self.labels_df.columns.tolist()}")
+            if attend_type == 'deep':
+                alt_col = 'shallow_attend'
+            else:
+                alt_col = 'deep_attend'
+            if alt_col in self.labels_df.columns:
+                print(f"Using '{alt_col}' instead.")
+                self.label_col = alt_col
+            else:
+                raise ValueError(f"Neither '{self.label_col}' nor '{alt_col}' found in label file!")
+                
+        # Create label map for quick lookup
+        for _, row in self.labels_df.iterrows():
+            # Check if the label is valid (not NaN)
+            if pd.notna(row[self.label_col]):
+                # Store label by (subject_id, question_period)
+                key = (str(row['ID']), row['stim'])
+                self.label_map[key] = row[self.label_col]
+        
+        # if cache exists, load it
+        param_dict = {
+            "attend_type": attend_type,
+            "eeg_win_size": eeg_win_size,
+            "eeg_win_step": eeg_win_step,
+            "face_win_size": face_win_size,
+            "face_win_step": face_win_step,
+            "eeg_mode": eeg_mode,
+            "face_mode": face_mode,
+            "excluded_subjects": sorted(list(self.excluded_subjects)) if self.excluded_subjects else []
+        }
+        param_hash = hashlib.md5(
+            json.dumps(param_dict, sort_keys=True).encode()
+        ).hexdigest()[:8]
+
+        # Create structured cache directory using parameter information
+        base_cache_dir = cache_dir or os.path.join(eeg_folder, "dataset_cache")
+        
+        # Include attend type, window size and EEG mode in the cache directory structure
+        structured_dir = os.path.join(
+            base_cache_dir,
+            f"attend_{param_dict['attend_type']}",
+            f"win_{param_dict['eeg_win_size']}",
+            f"eeg_{param_dict['eeg_mode']}"
+        )
+        
+        # If excluding subjects, add that to the directory path
+        if self.excluded_subjects:
+            excluded_str = "_".join(sorted(self.excluded_subjects))
+            structured_dir = os.path.join(structured_dir, f"excl_{excluded_str}")
+        
+        
+        self.cache_dir = structured_dir
+        os.makedirs(self.cache_dir, exist_ok=True)
+        
+        # Still include the hash for uniqueness
+        self.cache_path = os.path.join(self.cache_dir, f"samples_{param_hash}.pt")
+        if use_cache and os.path.exists(self.cache_path):
+            print(f"Loading dataset from cache: {self.cache_path}")
+            try:
+                cache_data = torch.load(self.cache_path)
+                self.samples = cache_data.get('samples', [])
+                dummy_len = len(self.samples)
+                
+                # Create a dummy indexer class that has a rows attribute with the right length
+                class DummyIndexer:
+                    def __init__(self, length):
+                        self.rows = [None] * length
+                    def __len__(self):
+                        return len(self.rows)
+                
+                self.eeg_indexer = DummyIndexer(dummy_len)
+                print(f"Successfully loaded dataset from cache with {dummy_len} samples")
+                return  # Skip the rest of initialization
+            except Exception as e:
+                print(f"Warning: failed to load cache ({e})")
+                # Proceed with normal initialization
         
         # Get all EEG files
         eeg_files = [f for f in os.listdir(eeg_folder) if f.endswith('_EEG_recording_processed.csv')]
@@ -253,8 +344,16 @@ class MultiModalDataset(Dataset):
         
         # Find common subjects
         common_subjects = set(eeg_subjects).intersection(set(face_subjects))
+        
+        # Apply subject exclusion if any were specified
+        if self.excluded_subjects:
+            excluded_count = len(common_subjects.intersection(self.excluded_subjects))
+            common_subjects = common_subjects - self.excluded_subjects
+            print(f"Excluded {excluded_count} subjects: {sorted([int(s) for s in self.excluded_subjects if s in eeg_subjects and s in face_subjects])}")
+            
         print(f"Found {len(common_subjects)} subjects with both EEG and face data")
         print(f"Common subject IDs: {sorted([int(s) for s in common_subjects])}")
+
         
         # Verify if we can find label data for these subjects
         self.labels_df = pd.read_csv(label_file)
@@ -312,8 +411,16 @@ class MultiModalDataset(Dataset):
         print("Data alignment complete!")
         
         # Preprocess all data during initialization for efficient access
-        print("Preprocessing data for efficient access (this may take some time)...")
+        print("Preprocessing data (no cache found)...")
         self._preprocess_all_data()
+        try:
+            cache_data = {'samples': self.samples}
+            torch.save(cache_data, self.cache_path)
+            print(f"Saved cache to: {self.cache_path}")
+        except Exception as e:
+            print(f"Warning: cache save failed — {e}")
+
+
         
     def __len__(self):
         # Now we only use the EEG indexer since we're matching face data dynamically
@@ -397,6 +504,13 @@ class MultiModalDataset(Dataset):
                 })
         
         print(f"Preprocessing complete. Cached {len(self.samples)} samples.")
+        try:
+            cache_data = {'samples': self.samples}
+            torch.save(cache_data, self.cache_path)
+            print(f"Saved samples to cache: {self.cache_path}")
+        except Exception as e:
+            print(f"Warning: failed to save cache ({e})")
+
         # Clear the CSV cache to free memory
         del csv_cache
         
@@ -569,8 +683,12 @@ def test_multimodal_dataset():
     face_folder = '/media/volume/sdb/ail_project/processed_features/face/'
     label_file = '/media/volume/sdb/ail_project/labels/attention_labels_combined.csv'
     
+    # Optional: Specify subjects to exclude 
+    # No exclusions by default then set excluded_subjects to None
+    excluded_subjects = ['226', '240', '244',
+    '247', '252', '259', '277', '241', '242', '266', '274'] 
     # Initialize dataset
-    dataset = MultiModalDataset(eeg_folder, face_folder, label_file)
+    dataset = MultiModalDataset(eeg_folder, face_folder, label_file, excluded_subjects=excluded_subjects)
 
     # Print basic info
     print(f"\nDataset size: {len(dataset)} samples")
