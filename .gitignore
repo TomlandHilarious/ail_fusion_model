@@ -39,3 +39,21 @@ Thumbs.db
 *.npy
 *.npz
 *.h5
+
+# Model files (trained models are too large)
+*.pth
+*.pt
+*.ckpt
+*.weights
+
+# Backup files
+*.MODIFIED_*
+*_backup*
+
+# Large image files
+*.png
+*.jpg
+*.jpeg
+
+# Symlinks to external models
+eeg_conformer

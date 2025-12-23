@@ -136,10 +136,17 @@ class Decoder:
         bp_beta  = DataFilter.get_band_power(psd, 12.0, 30.0)
         bp_gamma = DataFilter.get_band_power(psd, 30.0, 100.0)
 
-        # diagnostic prints
-        print(f"alpha/beta: {bp_alpha / bp_beta:.3f}")
-        print(f"beta/theta: {bp_beta  / bp_theta:.3f}")
-        print(f"delta/theta: {bp_delta / bp_theta:.3f}")
+        # Only print detailed ratios every 1000 samples
+        global _band_power_count
+        if not hasattr(Decoder, '_band_power_count'):
+            Decoder._band_power_count = 0
+        Decoder._band_power_count += 1
+        
+        if Decoder._band_power_count % 10000 == 0:
+            print(f"Band power stats (sample {Decoder._band_power_count})")
+            print(f"  alpha/beta: {bp_alpha / bp_beta:.3f}")
+            print(f"  beta/theta: {bp_beta  / bp_theta:.3f}")
+            print(f"  delta/theta: {bp_delta / bp_theta:.3f}")
         return np.array([bp_delta, bp_theta, bp_alpha, bp_beta, bp_gamma],
                         dtype=np.float32)
 
@@ -166,15 +173,25 @@ class Decoder:
             
             # Use integer indices for dataframe slicing
             try:
-                sig = df_slice.iloc[start_idx:end_idx][self.cols].to_numpy().astype(np.float32)  # (T, C)
+                # Use float32 for raw mode, but float64 for band power (required by brainflow)
+                dtype = np.float64 if self.mode == 'band' else np.float32
+                sig = df_slice.iloc[start_idx:end_idx][self.cols].to_numpy().astype(dtype)  # (T, C)
             except Exception as e:
                 raise ValueError(f"Indexing error: {e}, start={start_idx}, end={end_idx}, df_len={len(df_slice)}")
 
             if self.mode == 'raw':
                 feats.append(sig.T)                                  # (C, T)
             elif self.mode == 'band':
-                ch_bands = [self._band_power_features(ch, self.fs)   # (5,)
-                            for ch in sig.T]
+                if (len(feats) % 100) == 0:
+                    print(f"Processing band power: {len(feats)} windows processed so far")
+                
+                ch_bands = []
+                for ch_idx, ch in enumerate(sig.T):
+                    # Print progress every 1000 windows for the first channel only
+                    if ch_idx == 0 and (len(feats) % 1000) == 0:
+                        print(f"  Channel {ch_idx+1}/{len(sig.T)}, window {len(feats)}")
+                    ch_bands.append(self._band_power_features(ch, self.fs))   # (5,)
+                
                 feats.append(np.stack(ch_bands, axis=0))             # (C, 5)
 
         # Before stacking, check if we have any features
@@ -304,6 +321,7 @@ class MultiModalDataset(Dataset):
             try:
                 cache_data = torch.load(self.cache_path)
                 self.samples = cache_data.get('samples', [])
+                self.metadata = cache_data.get('metadata', {})
                 dummy_len = len(self.samples)
                 
                 # Create a dummy indexer class that has a rows attribute with the right length
@@ -414,13 +432,97 @@ class MultiModalDataset(Dataset):
         print("Preprocessing data (no cache found)...")
         self._preprocess_all_data()
         try:
-            cache_data = {'samples': self.samples}
+            # Create detailed metadata for visualization and analysis purposes
+            metadata = {
+                # Basic dataset info
+                'attend_type': self.label_col,
+                'num_samples': len(self.samples),
+                'excluded_subjects': sorted(list(self.excluded_subjects)) if self.excluded_subjects else [],
+                
+                # EEG metadata
+                'eeg_cols': self.eeg_cols,
+                'eeg_mode': self.eeg_mode,
+                'eeg_fs': self.eeg_fs,
+                'eeg_win_size_sec': self.eeg_win_size_sec,
+                'eeg_win_step_sec': self.eeg_win_step_sec,
+                'eeg_channel_info': {
+                    'AF7': 'Anterior Frontal Left (Frontal Lobe)',
+                    'TP9': 'Temporal Parietal Left (Behind Ear)',
+                    'TP10': 'Temporal Parietal Right (Behind Ear)',
+                    'AF8': 'Anterior Frontal Right (Frontal Lobe)'
+                },
+                
+                # Face metadata
+                'face_cols': self.face_cols,
+                'face_mode': self.face_mode,
+                'face_fs': self.face_fs,
+                'face_win_size_sec': self.face_win_size_sec,
+                'face_win_step_sec': self.face_win_step_sec,
+                'face_feature_info': {
+                    'GazeX': 'Horizontal Gaze Position',
+                    'GazeY': 'Vertical Gaze Position',
+                    'Yaw': 'Head Yaw Rotation',
+                    'Pitch': 'Head Pitch Rotation',
+                    'Roll': 'Head Roll Rotation',
+                    'AU01': 'Inner Brow Raiser',
+                    'AU02': 'Outer Brow Raiser',
+                    'AU04': 'Brow Lowerer',
+                    'AU05': 'Upper Lid Raiser',
+                    'AU06': 'Cheek Raiser',
+                    'AU07': 'Lid Tightener',
+                    'AU09': 'Nose Wrinkler',
+                    'AU10': 'Upper Lip Raiser',
+                    'AU12': 'Lip Corner Puller (Smile)',
+                    'AU14': 'Dimpler',
+                    'AU15': 'Lip Corner Depressor',
+                    'AU17': 'Chin Raiser',
+                    'AU20': 'Lip Stretcher',
+                    'AU23': 'Lip Tightener',
+                    'AU25': 'Lips Part',
+                    'AU26': 'Jaw Drop',
+                    'AU45': 'Blink',
+                    'Pupil': 'Pupil Diameter'
+                }
+            }
+            
+            # Add band power specific metadata if using band power mode
+            if self.eeg_mode == 'band':
+                # In band power mode, each channel has 5 frequency bands
+                # The tensor shape is (N, C, 5) where C is the number of channels (4) and 5 is the number of bands
+                metadata['eeg_band_info'] = {
+                    'shape_explanation': 'For band power mode, data tensor has shape (N, C, 5) where N=windows, C=channels, 5=frequency bands',
+                    'frequency_bands': {
+                        0: 'Delta (0.5-4 Hz) - Deep sleep, unconsciousness',
+                        1: 'Theta (4-8 Hz) - Drowsiness, meditation, creativity',
+                        2: 'Alpha (8-13 Hz) - Relaxation, closing eyes, mental coordination',
+                        3: 'Beta (13-30 Hz) - Active thinking, focus, alertness',
+                        4: 'Gamma (30-100 Hz) - Cognitive processing, learning'
+                    },
+                    'data_structure': {
+                        'channel_dimension': 'Each channel (AF7, TP9, TP10, AF8) has its own set of 5 frequency bands',
+                        'band_dimension': 'Each frequency band (delta, theta, alpha, beta, gamma) is calculated for each channel'
+                    }
+                }
+                
+                # Also add a mapping to help with visualization - e.g., for feature at position [i,j]
+                channel_band_map = []
+                for ch_idx, ch_name in enumerate(self.eeg_cols):
+                    for band_idx, band_name in enumerate(['delta', 'theta', 'alpha', 'beta', 'gamma']):
+                        channel_band_map.append({
+                            'channel_idx': ch_idx,
+                            'channel_name': ch_name,
+                            'band_idx': band_idx,
+                            'band_name': band_name,
+                            'feature_name': f"{ch_name}_{band_name}"
+                        })
+                metadata['eeg_band_feature_map'] = channel_band_map
+        
+            # Save both samples and metadata
+            cache_data = {'samples': self.samples, 'metadata': metadata}
             torch.save(cache_data, self.cache_path)
-            print(f"Saved cache to: {self.cache_path}")
+            print(f"Saved samples and metadata to cache: {self.cache_path}")
         except Exception as e:
-            print(f"Warning: cache save failed — {e}")
-
-
+            print(f"Warning: failed to save cache ({e})")
         
     def __len__(self):
         # Now we only use the EEG indexer since we're matching face data dynamically
@@ -666,7 +768,7 @@ class MultiModalDataset(Dataset):
         return eeg_aligned, face_aligned
             
 # Test code for data loading
-def test_multimodal_dataset():
+def test_multimodal_dataset(excluded_subjects=None, eeg_mode='raw'):
     print("\n" + "="*50)
     print("Testing MultiModalDataset loading")
     print("="*50 + "\n")
@@ -685,10 +787,9 @@ def test_multimodal_dataset():
     
     # Optional: Specify subjects to exclude 
     # No exclusions by default then set excluded_subjects to None
-    excluded_subjects = ['226', '240', '244',
-    '247', '252', '259', '277', '241', '242', '266', '274'] 
+
     # Initialize dataset
-    dataset = MultiModalDataset(eeg_folder, face_folder, label_file, excluded_subjects=excluded_subjects)
+    dataset = MultiModalDataset(eeg_folder, face_folder, label_file, eeg_mode=eeg_mode, excluded_subjects=excluded_subjects)
 
     # Print basic info
     print(f"\nDataset size: {len(dataset)} samples")
@@ -749,5 +850,7 @@ def test_multimodal_dataset():
 
 # Run the test if this script is executed directly
 if __name__ == "__main__":
-    dataset = test_multimodal_dataset()
+    excluded_subjects = ['226', '240', '244',
+    '247', '252', '259', '277', '241', '242', '266', '274'] 
+    dataset = test_multimodal_dataset(eeg_mode='band', excluded_subjects=excluded_subjects)
     
