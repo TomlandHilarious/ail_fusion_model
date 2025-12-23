@@ -12,10 +12,22 @@ The dataset handles different data modalities and synchronizes them for training
 
 ## Repository Structure
 
-- `data_loader.py`: MultiModalDataset implementation for loading and preprocessing data
+### Core Files
+- `data_loader.py`: MultiModalDataset implementation with caching and preprocessing
+- `eeg_modeling.py`: EEG attention prediction using EEG-Conformer architecture
 - `model.py`: Neural network models for multimodal fusion
-- `eeg_modeling.py`: EEG-specific processing and modeling functions
-- `examine_data.ipynb`: Data exploration notebook
+
+### Evaluation Scripts
+- `cross_subject_evaluation.py`: Cross-subject validation and evaluation
+- `evaluate_multiple_subjects.py`: Batch evaluation across multiple subjects
+- `interactive_lda.py`: Linear Discriminant Analysis for feature exploration
+- `test_band_power.py`: EEG band power analysis utilities
+
+### Visualization
+- `visualization.py`: Training metrics and EEG signal visualization tools
+
+### Analysis Notebooks
+- `examine_data.ipynb`: Data exploration and analysis
 
 ## Data Format
 
